@@ -298,8 +298,21 @@ function seedData() {
     users[s.id] = { id: s.id, name: s.name, password: '123456', role: 'student', activity: 0, tweets: 0, posts: 0 };
   });
   users[ADMIN_ID].role = 'admin';
-  users[ADMIN_ID].password = 'Jackfu435729';
-  return { rev: 1, users, weights: { activity: 10, tweets: 15, posts: 20 } };
+  users[ADMIN_ID].password = '20061114';
+  users['852504219'].role = 'admin'; // 吴欣宇也是管理员
+  return { schema: 2, rev: 1, users, weights: { activity: 10, tweets: 15, posts: 20 } };
+}
+
+// 数据结构迁移：返回 true 表示有改动
+function applyMigrations(data) {
+  if (!data.schema || data.schema < 2) {
+    // v2：管理员密码改为 20061114，吴欣宇设为管理员
+    data.users[ADMIN_ID].password = '20061114';
+    data.users['852504219'].role = 'admin';
+    data.schema = 2;
+    return true;
+  }
+  return false;
 }
 
 function loadStore() {
@@ -317,6 +330,7 @@ function loadStore() {
         data.users[ADMIN_ID].name = '付凯';
         data.users[ADMIN_ID].role = 'admin';
         if (!data.rev) data.rev = 1;
+        if (applyMigrations(data)) data.rev = (data.rev || 0) + 1; // 迁移后提升版本号，同步到云端
         localStorage.setItem(STORE_KEY, JSON.stringify(data));
         return data;
       }
@@ -417,7 +431,9 @@ function adoptRemote(remote, notify) {
   });
   DB = remote;
   if (myId && DB.users[myId]) currentUser = DB.users[myId];
+  const migrated = applyMigrations(DB);
   localStorage.setItem(STORE_KEY, JSON.stringify(DB));
+  if (migrated) publishCloud(); // 把迁移后的数据回传云端
   if (currentUser) {
     if (activePage === 'overview') renderOverview();
     else if (activePage === 'profile') renderProfile();
