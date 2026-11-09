@@ -54,6 +54,9 @@
   .menu-item.active { background: rgba(102,126,234,.18); color: #fff; border-left-color: #667eea; }
   .logout { padding: 14px 22px; font-size: 13px; cursor: pointer; color: #8b93a5; border-top: 1px solid rgba(255,255,255,.08); }
   .logout:hover { color: #ff7b7b; }
+  .sync-status { padding: 8px 20px; font-size: 12px; color: #8b93a5; border-bottom: 1px solid rgba(255,255,255,.08); }
+  .sync-status.on { color: #67c23a; }
+  .sync-status.off { color: #e6a23c; }
 
   .main { margin-left: 220px; padding: 28px 32px; }
   .page { display: none; }
@@ -174,6 +177,7 @@
   <div class="sidebar" id="sidebar">
     <div class="logo">📊 宣传计分系统</div>
     <div class="user-info" id="userInfo"></div>
+    <div class="sync-status" id="syncStatus">☁ 云同步连接中…</div>
     <div class="menu">
       <div class="menu-item active" data-page="overview" onclick="switchPage('overview')">📋 数据总览</div>
       <div class="menu-item" data-page="profile" onclick="switchPage('profile')">👤 个人中心</div>
@@ -262,6 +266,9 @@
 
 <div class="toast" id="toast"></div>
 
+<script src="paho-mqtt.min.js"></script>
+<script>window.Paho||document.write('<script src="https:\/\/cdnjs.cloudflare.com\/ajax\/libs\/paho-mqtt\/1.1.0\/paho-mqtt.min.js"><\/script>')</script>
+<script>window.Paho||document.write('<script src="https:\/\/cdn.jsdelivr.net\/npm\/paho-mqtt@1.1.0\/paho-mqtt.min.js"><\/script>')</script>
 <script>
 /* ==================== 数据层 ==================== */
 const STORE_KEY = 'campusPoints_v1';
@@ -292,7 +299,7 @@ function seedData() {
   });
   users[ADMIN_ID].role = 'admin';
   users[ADMIN_ID].password = 'Jackfu435729';
-  return { users, weights: { activity: 10, tweets: 15, posts: 20 } };
+  return { rev: 1, users, weights: { activity: 10, tweets: 15, posts: 20 } };
 }
 
 function loadStore() {
@@ -309,6 +316,7 @@ function loadStore() {
         });
         data.users[ADMIN_ID].name = '付凯';
         data.users[ADMIN_ID].role = 'admin';
+        if (!data.rev) data.rev = 1;
         localStorage.setItem(STORE_KEY, JSON.stringify(data));
         return data;
       }
@@ -320,11 +328,116 @@ function loadStore() {
 }
 
 function saveStore() {
+  DB.rev = (DB.rev || 0) + 1;
   localStorage.setItem(STORE_KEY, JSON.stringify(DB));
+  publishCloud();
 }
 
 let DB = loadStore();
 let currentUser = null;
+
+/* ==================== 云端同步（MQTT 保留消息，浏览器直连） ==================== */
+const CLOUD_TOPIC = 'campus/points/fk-852/v1/db';
+const CLOUD_BROKERS = [
+  { host: 'broker.emqx.io',    port: 8084 },
+  { host: 'broker.hivemq.com', port: 8884 }
+];
+let cloudClient = null;
+let cloudOnline = false;
+let firstSyncDone = false;
+let brokerIndex = 0;
+let activePage = 'overview';
+
+function setSyncStatus(on, text) {
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  el.className = 'sync-status ' + (on ? 'on' : 'off');
+  el.textContent = text || (on ? '☁ 云同步已连接' : '☁ 云同步离线（数据暂存本机）');
+}
+
+function pahoApi() {
+  return window.Paho && (window.Paho.Client ? window.Paho : window.Paho.MQTT);
+}
+
+function cloudConnect() {
+  const PAHO = pahoApi();
+  if (!PAHO) { setSyncStatus(false); setTimeout(cloudConnect, 5000); return; }
+  const b = CLOUD_BROKERS[brokerIndex % CLOUD_BROKERS.length];
+  try {
+    const c = new PAHO.Client(b.host, b.port, '/mqtt', 'cp-' + Math.random().toString(16).slice(2));
+    cloudClient = c;
+    c.onConnectionLost = () => {
+      cloudOnline = false;
+      setSyncStatus(false);
+      setTimeout(cloudConnect, 5000);
+    };
+    c.onMessageArrived = m => {
+      if (m.destinationName !== CLOUD_TOPIC) return;
+      let remote = null;
+      try { remote = JSON.parse(m.payloadString); } catch (e) { return; }
+      if (!remote || !remote.users || !remote.weights) return; // 忽略无效消息
+      const wasFirst = !firstSyncDone;
+      firstSyncDone = true;
+      const rRev = remote.rev || 0, lRev = DB.rev || 0;
+      if (rRev > lRev) {
+        adoptRemote(remote, !wasFirst);
+      } else if (rRev < lRev) {
+        publishCloud(); // 本地数据更新（或云端已被清空），用本地数据重建云端
+      }
+    };
+    c.connect({
+      useSSL: true, timeout: 8, keepAliveInterval: 30,
+      onSuccess: () => {
+        cloudOnline = true;
+        setSyncStatus(true);
+        c.subscribe(CLOUD_TOPIC);
+        // 若云端暂无数据，2.5 秒后用本地数据初始化云端
+        setTimeout(() => { if (!firstSyncDone) publishCloud(); }, 2500);
+      },
+      onFailure: () => {
+        cloudOnline = false;
+        setSyncStatus(false);
+        brokerIndex++;
+        setTimeout(cloudConnect, 3000);
+      }
+    });
+  } catch (e) {
+    brokerIndex++;
+    setTimeout(cloudConnect, 3000);
+  }
+}
+
+function adoptRemote(remote, notify) {
+  const myId = currentUser ? currentUser.id : null;
+  // 兜底：确保所有成员字段齐全
+  STUDENTS.forEach(s => {
+    if (!remote.users[s.id]) {
+      remote.users[s.id] = { id: s.id, name: s.name, password: '123456', role: 'student', activity: 0, tweets: 0, posts: 0 };
+    }
+  });
+  DB = remote;
+  if (myId && DB.users[myId]) currentUser = DB.users[myId];
+  localStorage.setItem(STORE_KEY, JSON.stringify(DB));
+  if (currentUser) {
+    if (activePage === 'overview') renderOverview();
+    else if (activePage === 'profile') renderProfile();
+    if (notify) toast(activePage === 'admin' ? '☁ 云端有新数据（未打断当前编辑）' : '☁ 数据已同步更新');
+  }
+}
+
+function publishCloud() {
+  const PAHO = pahoApi();
+  if (cloudClient && cloudOnline && PAHO) {
+    try {
+      const msg = new PAHO.Message(JSON.stringify(DB));
+      msg.destinationName = CLOUD_TOPIC;
+      msg.retained = true;
+      cloudClient.send(msg);
+    } catch (e) {}
+  }
+}
+
+cloudConnect();
 
 function scoreOf(u) {
   return (u.activity || 0) * DB.weights.activity
@@ -395,6 +508,7 @@ function closeMenu() {
 
 function switchPage(name) {
   closeMenu();
+  activePage = name;
   document.querySelectorAll('.menu-item').forEach(m => m.classList.toggle('active', m.dataset.page === name));
   document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + name));
   if (name === 'overview') renderOverview();
